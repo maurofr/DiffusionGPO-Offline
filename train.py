@@ -340,7 +340,13 @@ def parse_args():
     parser.add_argument("--sdxl", action='store_true', help="Train sdxl")
     
     ## DPO
-    parser.add_argument("--sft", action='store_true', help="Run Supervised Fine-Tuning instead of Direct Preference Optimization")
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="DPO",
+        choices=("sft", "DPO", "IPO", "SLiC", "exp"),
+        help=("Loss function f to be applied to \\beta\\phi_\\theta within the GPO framework, or sft.")
+    )
     parser.add_argument("--beta_dpo", type=float, default=5000, help="The beta DPO temperature controlling strength of KL penalty")
     parser.add_argument(
         "--hard_skip_resume", action="store_true", help="Load weights etc. but don't iter through loader for loader resume, useful b/c resume takes forever"
@@ -382,7 +388,6 @@ def parse_args():
         else:
             args.resolution = 512
             
-    args.train_method = 'sft' if args.sft else 'dpo'
     return args
 
 
@@ -598,7 +603,7 @@ def main():
         text_encoder_two.requires_grad_(False)
     else:
         text_encoder.requires_grad_(False)
-    if args.train_method == 'dpo': ref_unet.requires_grad_(False)
+    if args.loss != 'sft': ref_unet.requires_grad_(False)
 
     # xformers efficient attention
     if is_xformers_available():
@@ -622,7 +627,7 @@ def main():
         def save_model_hook(models, weights, output_dir):
             
             if len(models) > 1:
-                assert args.train_method == 'dpo' # 2nd model is just ref_unet in DPO case
+                assert args.loss != 'sft' # 2nd model is just ref_unet in DPO case
             models_to_save = models[:1]
             for i, model in enumerate(models_to_save):
                 model.save_pretrained(os.path.join(output_dir, "unet"))
@@ -633,7 +638,7 @@ def main():
         def load_model_hook(models, input_dir):
 
             if len(models) > 1:
-                assert args.train_method == 'dpo' # 2nd model is just ref_unet in DPO case
+                assert args.loss != 'sft' # 2nd model is just ref_unet in DPO case
             models_to_load = models[:1]
             for i in range(len(models_to_load)):
                 # pop models so that they are not loaded again
@@ -712,7 +717,7 @@ def main():
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if 'pickapic' in args.dataset_name or (args.train_method == 'dpo'):
+    if 'pickapic' in args.dataset_name or (args.loss != 'sft'):
         pass
     elif args.image_column is None:
         image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
@@ -767,7 +772,7 @@ def main():
     ##### START BIG OLD DATASET BLOCK #####
     
     #### START PREPROCESSING/COLLATION ####
-    if args.train_method == 'dpo':
+    if args.loss != 'sft':
         print("Ignoring image_column variable, reading from jpg_0 and jpg_1")
         def preprocess_train(examples):
             all_pixel_values = []
@@ -825,7 +830,7 @@ def main():
             def choice_model_says_flip(batch):
                 assert len(batch['caption'])==1 # Can switch to iteration but not needed for nwo
                 return do_flip(batch['jpg_0'][0], batch['jpg_1'][0], batch['caption'][0])
-    elif args.train_method == 'sft':
+    elif args.loss == 'sft':
         def preprocess_train(examples):
             if 'pickapic' in args.dataset_name:
                 images = []
@@ -929,13 +934,13 @@ def main():
         print("Offloading text encoders to cpu")
         text_encoder_one = accelerate.cpu_offload(text_encoder_one)
         text_encoder_two = accelerate.cpu_offload(text_encoder_two)
-        if args.train_method == 'dpo':
+        if args.loss != 'sft':
             ref_unet.to(accelerator.device, dtype=weight_dtype)
             print("offload ref_unet")
             ref_unet = accelerate.cpu_offload(ref_unet)
     else:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-        if args.train_method == 'dpo':
+        if args.loss != 'sft':
             ref_unet.to(accelerator.device, dtype=weight_dtype)
     ### END ACCELERATOR PREP ###
     
@@ -1011,7 +1016,7 @@ def main():
                 continue
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                if args.train_method == 'dpo':
+                if args.loss != 'sft':
                     # y_w and y_l were concatenated along channel dimension
                     feed_pixel_values = torch.cat(batch["pixel_values"].chunk(2, dim=1))
                     # If using AIF then we haven't ranked yet so do so now
@@ -1019,7 +1024,7 @@ def main():
                     if args.choice_model:
                         if choice_model_says_flip(batch):
                             feed_pixel_values = feed_pixel_values.flip(0)
-                elif args.train_method == 'sft':
+                elif args.loss == 'sft':
                     feed_pixel_values = batch["pixel_values"]
                 
                 #### Diffusion Stuff ####
@@ -1050,7 +1055,7 @@ def main():
                     timesteps_0_to_3 = timesteps % 4
                     timesteps = 250 * timesteps_0_to_3 + 249
                 
-                if args.train_method == 'dpo': # make timesteps and noise same for pairs in DPO
+                if args.loss != 'sft': # make timesteps and noise same for pairs in DPO
                     timesteps = timesteps.chunk(2)[0].repeat(2)
                     noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
 
@@ -1090,7 +1095,7 @@ def main():
                                                           caption_column='caption',
                                                            is_train=True,
                                                           )
-                    if args.train_method == 'dpo':
+                    if args.loss != 'sft':
                         prompt_batch["prompt_embeds"] = prompt_batch["prompt_embeds"].repeat(2, 1, 1)
                         prompt_batch["pooled_prompt_embeds"] = prompt_batch["pooled_prompt_embeds"].repeat(2, 1)
                     unet_added_conditions = {"time_ids": add_time_ids,
@@ -1098,7 +1103,7 @@ def main():
                 else: # sd1.5
                     # Get the text embedding for conditioning
                     encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                    if args.train_method == 'dpo':
+                    if args.loss != 'sft':
                         encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
                 #### END PREP BATCH ####
                         
@@ -1116,9 +1121,9 @@ def main():
                                   added_cond_kwargs = added_cond_kwargs
                                  ).sample
                 #### START LOSS COMPUTATION ####
-                if args.train_method == 'sft': # SFT, casting for F.mse_loss
+                if args.loss == 'sft': # SFT, casting for F.mse_loss
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                elif args.train_method == 'dpo':
+                else:
                     # model_pred and ref_pred will be (2 * LBS) x 4 x latent_spatial_dim x latent_spatial_dim
                     # losses are both 2 * LBS
                     # 1st half of tensors is preferred (y_w), second half is unpreferred
@@ -1142,7 +1147,17 @@ def main():
                     scale_term = -0.5 * args.beta_dpo
                     inside_term = scale_term * (model_diff - ref_diff)
                     implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
-                    loss = -1 * F.logsigmoid(inside_term).mean()
+
+                    if args.loss == "DPO":
+                        loss = - F.logsigmoid(inside_term).mean()
+                    elif args.loss == "IPO":
+                        loss = torch.square(inside_term - 1).mean()
+                    elif args.loss == "SLiC":
+                        loss = torch.clamp(1 - inside_term, min=0).mean()
+                    elif args.loss == "exp":
+                        loss = torch.exp(-inside_term).mean()
+                    else: 
+                        raise ValueError("The provided loss is not impemented. Make sure to use 'DPO', 'IPO', 'SLiC' or 'exp'.")
                 #### END LOSS COMPUTATION ###
                     
                 # Gather the losses across all processes for logging 
@@ -1151,7 +1166,7 @@ def main():
                 # Also gather:
                 # - model MSE vs reference MSE (useful to observe divergent behavior)
                 # - Implicit accuracy
-                if args.train_method == 'dpo':
+                if args.loss != 'sft':
                     avg_model_mse = accelerator.gather(raw_model_loss.repeat(args.train_batch_size)).mean().item()
                     avg_ref_mse = accelerator.gather(raw_ref_loss.repeat(args.train_batch_size)).mean().item()
                     avg_acc = accelerator.gather(implicit_acc).mean().item()
@@ -1171,7 +1186,7 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                if args.train_method == 'dpo':
+                if args.loss != 'sft':
                     accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
                     accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
                     accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
@@ -1186,7 +1201,7 @@ def main():
                         logger.info("Pretty sure saving/loading is fixed but proceed cautiously")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            if args.train_method == 'dpo':
+            if args.loss != 'sft':
                 logs["implicit_acc"] = avg_acc
             progress_bar.set_postfix(**logs)
 
