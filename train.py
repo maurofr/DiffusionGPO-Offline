@@ -300,6 +300,14 @@ def parse_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
+    parser.add_argument(
+        "--wandb_dir",
+        type=str,
+        default=None,
+        help=(
+            'Directory to save wandb run to.'
+        )
+    )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
         "--checkpointing_steps",
@@ -956,7 +964,13 @@ def main():
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        accelerator.init_trackers(args.tracker_project_name, tracker_config)
+        accelerator.init_trackers(
+            args.tracker_project_name, 
+            tracker_config, 
+            init_kwargs={'wandb': {
+                'dir': args.wandb_dir,
+            }}
+        )
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
