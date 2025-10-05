@@ -196,6 +196,9 @@ def parse_args():
         help="whether to supress horizontal flipping",
     )
     parser.add_argument(
+        "--lora", action="store_true", help="Use LORA for finetuning UNet"
+    )
+    parser.add_argument(
         "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
@@ -613,6 +616,23 @@ def main():
         text_encoder.requires_grad_(False)
     if args.loss != 'sft': ref_unet.requires_grad_(False)
 
+    if args.lora:
+        from peft import LoraConfig, get_peft_model
+
+        unet.requires_grad_(False)
+
+        # Define LoRA config (target attention layers)
+        rank = 16
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=rank,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+
+        # Convert to LoRA model
+        unet.add_adapter(lora_config)
+
     # xformers efficient attention
     if is_xformers_available():
         import xformers
@@ -677,9 +697,14 @@ def main():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
+    optimizer_params = unet.parameters()
+    if args.lora:
+        lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
+        optimizer_params = lora_layers
+
     if args.use_adafactor or args.sdxl:
         print("Using Adafactor either because you asked for it or you're using SDXL")
-        optimizer = transformers.Adafactor(unet.parameters(),
+        optimizer = transformers.Adafactor(optimizer_params,
                                            lr=args.learning_rate,
                                            weight_decay=args.adam_weight_decay,
                                            clip_threshold=1.0,
@@ -687,7 +712,7 @@ def main():
                                           relative_step=False)
     else:
         optimizer = torch.optim.AdamW(
-            unet.parameters(),
+            optimizer_params,
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
@@ -931,6 +956,11 @@ def main():
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
 
+    if args.lora and weight_dtype != torch.float32:
+        from diffusers.training_utils import cast_training_params
+        unet.to(weight_dtype)
+        # only upcast trainable parameters (LoRA) into fp32
+        cast_training_params(pipeline.new_unet, dtype=torch.float32)
         
     # Move text_encode and vae to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
@@ -1190,7 +1220,7 @@ def main():
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     if not args.use_adafactor: # Adafactor does itself, maybe could do here to cut down on code
-                        accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                        accelerator.clip_grad_norm_(optimizer_params, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
