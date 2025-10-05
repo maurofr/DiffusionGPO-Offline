@@ -960,7 +960,7 @@ def main():
         from diffusers.training_utils import cast_training_params
         unet.to(weight_dtype)
         # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(pipeline.new_unet, dtype=torch.float32)
+        cast_training_params(unet, dtype=torch.float32)
         
     # Move text_encode and vae to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
