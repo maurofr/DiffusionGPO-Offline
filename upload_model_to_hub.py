@@ -1,4 +1,4 @@
-from huggingface_hub import upload_file
+from huggingface_hub import upload_file, create_repo
 
 def parse_args():
     import argparse
@@ -10,6 +10,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    create_repo(args.repo_id, token=args.hf_token, private=False, exist_ok=True)
 
     for fname in ['config.json', 'diffusion_pytorch_model.safetensors']:
         print(f"Uploading {fname}...")
